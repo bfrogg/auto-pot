@@ -6,20 +6,102 @@
 #include <semphr.h>
 #include <DS1302.h>
 
-#define LAMP_PIN        3
-#define SOIL_SENSOR_PIN 8
-#define WATERING_PIN    2
-#define LOW_WATER_PIN   4
-#define RTC_CEN_PIN     5 
+#define LAMP_PIN        3  // вывод ШИМ лампы освещения
+#define SOIL_SENSOR_PIN 8  // вывод датчика влажности
+#define WATERING_PIN    2  // вывод клапана полива
+#define LOW_WATER_PIN   4  // вывод светодиода низкого уровня воды
+#define RTC_CEN_PIN     5  // выводы часов реального времени
 #define RTC_IO_PIN      6  
-#define RTC_SCLK_PIN    7 
+#define RTC_SCLK_PIN    7  
 
-#define WATERING_TIME_MS         4000
-#define WAITING_TIME_SOIL_SENSOR 10000
-#define LOW_WATER_LED_TIME_MS    3000
+#define WATERING_TIME_MS         7000    // время полива мс
+#define WAITING_TIME_SOIL_SENSOR 10000   // время ожидания после полива
+#define LOW_WATER_LED_TIME_MS    3000    // период мигания светодиода
+
+#define LAMP_ON_TIME_HR     8    // время включения лампы
+#define LAMP_OFF_TIME_HR    23   // время выключения лампы
+#define LAMP_RISE_TIME_MIN  20   // время плавного нарастания лампы
+#define LAMP_RISE_TIME_MS   (LAMP_RISE_TIME_MIN * 60000)
+
+#define LAMP_OFF            255      
+#define LAMP_MAX_BRIGHTNESS 0
+#define LAMP_MIN_BRIGHTNESS 47
+#define LAMP_RANGE          LAMP_MIN_BRIGHTNESS - LAMP_MAX_BRIGHTNESS
+
+class Pot {
+
+  bool m_lampState;
+
+public:
+
+  Pot() : m_lampState(false) 
+  {
+    digitalWrite(WATERING_PIN, HIGH);
+    digitalWrite(LOW_WATER_PIN, LOW);
+    analogWrite(LAMP_PIN, LAMP_OFF);
+  }
+
+  bool isSoilDry() 
+  {
+    if (digitalRead(SOIL_SENSOR_PIN) == HIGH) {
+      Serial.println("Soil is dry");
+      return true;
+    } else return false;
+  }
+
+  void valveOn() 
+  {
+    digitalWrite(WATERING_PIN, LOW);
+    Serial.println("Valve ON");
+  }
+
+  void valveOff() 
+  {
+    digitalWrite(WATERING_PIN, HIGH);
+    Serial.println("Valve OFF");
+  }
+
+  void blinkLowWaterLed() 
+  {
+    Serial.println("Low water");
+    digitalWrite(LOW_WATER_PIN, HIGH);
+    vTaskDelay( LOW_WATER_LED_TIME_MS / portTICK_PERIOD_MS  );
+    digitalWrite(LOW_WATER_PIN, LOW);
+    vTaskDelay( LOW_WATER_LED_TIME_MS / portTICK_PERIOD_MS  );
+  }
+
+  bool lampState() 
+  {
+    return m_lampState;
+  }
+
+  void lampOn() 
+  {
+    Serial.println("Lamp ON");
+    m_lampState = true;
+    for (int i = LAMP_MIN_BRIGHTNESS; i >= LAMP_MAX_BRIGHTNESS; --i) {
+      analogWrite(LAMP_PIN, i);
+      vTaskDelay( (LAMP_RISE_TIME_MS / LAMP_RANGE) / portTICK_PERIOD_MS  );
+    } 
+  }
+
+  void lampOff() 
+  {
+    Serial.println("Lamp OFF");
+    m_lampState = false;
+    for (int i = LAMP_MAX_BRIGHTNESS; i <= LAMP_MIN_BRIGHTNESS; ++i) {
+      analogWrite(LAMP_PIN, i);
+      vTaskDelay( (LAMP_RISE_TIME_MS / LAMP_RANGE) / portTICK_PERIOD_MS  );
+      Serial.println(i);
+    }
+    analogWrite(LAMP_PIN, LAMP_OFF);
+  }
+};
 
 void WateringTask( void *pvParameters );
 void LampTask( void *pvParameters );
+
+Pot pot;
 
 DS1302 rtc(RTC_CEN_PIN, RTC_IO_PIN, RTC_SCLK_PIN);
 
@@ -64,31 +146,19 @@ void WateringTask(void *pvParameters)
 {
   (void) pvParameters;
 
-  digitalWrite(LOW_WATER_PIN, LOW);
-  digitalWrite(WATERING_PIN, HIGH);
-
   for (;;) {
-    if (digitalRead(SOIL_SENSOR_PIN) == HIGH) { // если сенсор дал сигнал
-      digitalWrite(WATERING_PIN, LOW); // открываем клапан
-      Serial.println("Water ON");
+    if (pot.isSoilDry()) {
+      pot.valveOn();
       vTaskDelay( WATERING_TIME_MS / portTICK_PERIOD_MS  ); // поливать WATERING_TIME_MS секунд
-      digitalWrite(WATERING_PIN, HIGH);
-      Serial.println("Water OFF");
+      pot.valveOff();
       vTaskDelay( WAITING_TIME_SOIL_SENSOR / portTICK_PERIOD_MS  );
-      if (digitalRead(SOIL_SENSOR_PIN) == HIGH) { // если сенсор все так же дает сигнал, значит закончилась вода
-        Serial.println("Low water");
-        digitalWrite(WATERING_PIN, LOW); // открываем клапан
-        while (digitalRead(SOIL_SENSOR_PIN) == HIGH) { // пока в емкости не появится вода, мигаем светодиодом
-          digitalWrite(LOW_WATER_PIN, HIGH);
-          vTaskDelay( LOW_WATER_LED_TIME_MS / portTICK_PERIOD_MS  );
-          digitalWrite(LOW_WATER_PIN, LOW);
-          vTaskDelay( LOW_WATER_LED_TIME_MS / portTICK_PERIOD_MS  );
-          Serial.println("Low water led");
-        }
-        digitalWrite(WATERING_PIN, HIGH); // закрываем клапан
+      if (pot.isSoilDry()) { // если сенсор все так же дает сигнал, значит закончилась вода
+        pot.valveOn();
+        while (pot.isSoilDry())
+          pot.blinkLowWaterLed();
+        pot.valveOff();
       }
     }
-    
     vTaskDelay( 500 / portTICK_PERIOD_MS  );
   }
 }
@@ -97,27 +167,14 @@ void LampTask(void *pvParameters)
 {
   (void) pvParameters;
 
-  bool lampState = false;
-
   for (;;) {
     Time t = rtc.time();
 
-    if (t.hr > 8 && t.hr < 23 && !lampState) {
-      Serial.println("LAMP ON");
-      lampState = true;
-      for (int i = 0; i < 256; ++i) { // плавное включение 20 минут
-        analogWrite(LAMP_PIN, i);
-        Serial.println(i);
-        vTaskDelay( 4687 / portTICK_PERIOD_MS  );
-      }
+    if (t.hr >= LAMP_ON_TIME_HR && t.hr < LAMP_OFF_TIME_HR && !pot.lampState()) {
+      pot.lampOn();
     }
-    if (t.hr < 8 && t.hr > 23 && lampState) {
-      Serial.println("LAMP OFF");
-      lampState = false;
-      for (int i = 255; i >= 0; --i) { // плавное выключение 20 минут
-        analogWrite(LAMP_PIN, i);
-        vTaskDelay( 4687 / portTICK_PERIOD_MS  );
-      }
+    if (t.hr < LAMP_ON_TIME_HR && t.hr >= LAMP_OFF_TIME_HR && pot.lampState()) {
+      pot.lampOff();
     }
     vTaskDelay( 1000 / portTICK_PERIOD_MS  );
   }
